@@ -1,13 +1,14 @@
 """Compose — strategic asset allocation workbench.
 
-Seven tabs:
+Eight tabs:
   1. Overview     — headline: exp return / vol / Sharpe / TE, weights, risk contribution
   2. Universe     — asset table, history, correlation preview
-  3. Views (μ)    — side-by-side μ estimates; manual CMAs editor
+  3. Views (μ)    — side-by-side μ estimates; manual CMAs editor; BL views editor
   4. Covariance   — Σ and correlation heatmaps for each estimator
   5. Optimize     — efficient frontier + Capital Market Line, solved portfolio starred
-  6. Stress       — re-solve under a stress Σ; weight drift
-  7. Methodology  — plain-English explanation, renders METHODOLOGY.md
+  6. Backtest     — walk-forward comparison of methods + stacked-area weights
+  7. Stress       — re-solve under a stress Σ; weight drift
+  8. Methodology  — plain-English explanation, renders METHODOLOGY.md
 
 Every portfolio is a composition.
 """
@@ -23,11 +24,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from compose_lib.backtest import compare_methods, metric_grid
 from compose_lib.covariance import (
     cov_to_corr,
     condition_number,
+    ewma_cov,
     ledoit_wolf_cov,
     oas_cov,
+    regime_blended_cov,
     sample_cov,
     stress_blended_cov,
 )
@@ -39,6 +43,7 @@ from compose_lib.diagnostics import (
 )
 from compose_lib.expected_returns import (
     black_litterman_equilibrium,
+    blend_bl_with_views,
     historical_mean,
     jorion_shrinkage,
     manual_mu,
@@ -55,6 +60,7 @@ from compose_lib.optimize import (
     resampled,
     risk_parity,
 )
+from compose_lib.regime_label import regime_from_drawdown
 from compose_lib.returns import compute_monthly_returns, returns_from_uploaded
 from compose_lib.universe import (
     ALL_ASSETS,
@@ -64,6 +70,33 @@ from compose_lib.universe import (
     default_group_bounds,
     display_names,
 )
+
+
+# Tabula → compose code mapping. Tabula stores series_ids per the
+# watchlist; we map a few common ones onto compose's asset universe so
+# users with a tabula panel can drive Compose end-to-end. Anything not
+# in this mapping is dropped silently.
+TABULA_SERIES_MAP: dict[str, str] = {
+    # --- Yahoo tickers used by tabula (most common case) ---
+    "SPY": "us_eq",
+    "AGG": "us_agg",
+    "EFA": "intl_eq",
+    "EEM": "em_eq",
+    "GLD": "gold",
+    "DBC": "comdty",
+    "IEF": "us_tsy",
+    "LQD": "us_ig",
+    "HYG": "us_hy",
+    "TIP": "us_tips",
+    "VNQ": "us_reit",
+    "^IRX": "cash",
+    # --- common alternative IDs ---
+    "^GSPC": "us_eq",
+    "GC=F": "gold",
+}
+
+
+TABULA_PANEL_PATH = Path("/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet")
 
 
 st.set_page_config(page_title="Compose", layout="wide", page_icon="🎼")
@@ -80,11 +113,42 @@ def _cached_prices():
 
 
 @st.cache_data(show_spinner=False)
-def _cached_returns(panel_key: str, panel_bytes: bytes, codes_key: str):
+def _cached_returns(
+    panel_key: str, panel_bytes: bytes, codes_key: str,
+    extend_history: bool = False, start: str | None = "2000-01-01",
+):
     panel = pd.read_parquet(io.BytesIO(panel_bytes))
     panel.index = pd.to_datetime(panel.index)
     codes = codes_key.split(",")
-    return compute_monthly_returns(panel, codes)
+    return compute_monthly_returns(
+        panel, codes,
+        extend_history=extend_history, start=start,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_tabula_panel(path_str: str):
+    """Load the tabula long-format parquet and pivot to a wide price panel
+    keyed by compose asset code. We read directly with `pd.read_parquet`
+    rather than importing tabula, per the brief."""
+    df = pd.read_parquet(path_str)
+    if not {"series_id", "observation_date", "value"}.issubset(df.columns):
+        raise ValueError(
+            f"tabula parquet missing required columns; got {list(df.columns)}"
+        )
+    df["observation_date"] = pd.to_datetime(df["observation_date"])
+    # Map series_id -> compose code (drop unmapped)
+    df["code"] = df["series_id"].map(TABULA_SERIES_MAP)
+    df = df.dropna(subset=["code"])
+    if df.empty:
+        return pd.DataFrame()
+    wide = (df.pivot_table(
+        index="observation_date", columns="code",
+        values="value", aggfunc="last",
+    ).sort_index())
+    # Translate compose codes back to the ticker names compute_monthly_returns expects.
+    wide.columns = [BY_CODE[c].ticker for c in wide.columns]
+    return wide
 
 
 GOLD = "#FFD700"
@@ -99,17 +163,22 @@ CRIMSON = "#D10000"
 st.sidebar.title("Compose")
 st.sidebar.caption("*Every portfolio is a composition.*")
 
-data_choice = st.sidebar.radio(
+source_mode = st.sidebar.selectbox(
     "Panel source",
-    ["Default (built-in)", "Upload CSV / JSON"],
-    horizontal=False,
+    ["Public (Yahoo + cache)", "Private (tabula)", "Custom upload"],
+    index=0,
+    help=(
+        "Public — built-in cached Yahoo panel (default). "
+        "Private — read tabula's long-format parquet. "
+        "Custom — upload your own CSV/parquet."
+    ),
 )
 
 uploaded = None
 upload_kind = "prices"
-if data_choice == "Upload CSV / JSON":
+if source_mode == "Custom upload":
     uploaded = st.sidebar.file_uploader(
-        "File (first column = date)", type=["csv", "json"],
+        "File (first column = date)", type=["csv", "json", "parquet"],
     )
     upload_kind = st.sidebar.radio(
         "Upload contains", ["prices", "returns"], index=0, horizontal=True,
@@ -117,6 +186,18 @@ if data_choice == "Upload CSV / JSON":
     )
 
 tier_name = st.sidebar.radio("Universe", list(TIERS.keys()), index=1)
+
+long_term_model = st.sidebar.checkbox(
+    "Long-term model (full history)",
+    value=False,
+    help=(
+        "OFF (default): panel filtered to 2000-01-01+. "
+        "ON: use the full available history. With Public source this also "
+        "splices Vanguard mutual-fund / FRED predecessors onto the modern "
+        "ETFs (SPY←VFINX from 1980, AGG←VBMFX from 1986, etc.) — fixes "
+        "Tier 3's HYG-induced 2007 cliff."
+    ),
+)
 
 with st.sidebar.expander("Expected returns (μ)", expanded=True):
     mu_method = st.radio(
@@ -141,10 +222,11 @@ with st.sidebar.expander("Expected returns (μ)", expanded=True):
 with st.sidebar.expander("Covariance (Σ)", expanded=True):
     cov_method = st.radio(
         "Σ method",
-        ["ledoit_wolf", "oas", "sample", "stress_blended"],
+        ["ledoit_wolf", "oas", "ewma", "sample", "stress_blended"],
         format_func=lambda x: {
             "ledoit_wolf": "Ledoit-Wolf (default)",
             "oas": "OAS shrinkage",
+            "ewma": "EWMA (recency-weighted)",
             "sample": "Sample",
             "stress_blended": "Stress-blended (SPX drawdown)",
         }[x],
@@ -162,6 +244,24 @@ with st.sidebar.expander("Covariance (Σ)", expanded=True):
     else:
         dd_threshold = 0.10
         stress_weight = 0.30
+    if cov_method == "ewma":
+        ewma_half_life = st.slider(
+            "EWMA half-life (months)", 6, 24, 12, 1,
+            help="Weight on observation k months ago is 0.5^(k/HL).",
+        )
+    else:
+        ewma_half_life = 12
+
+    use_regime_cov = st.checkbox(
+        "Regime-aware Σ (cluster + blend)",
+        value=False,
+        help=(
+            "Estimate Σ separately per regime label and blend by today's "
+            "regime probabilities. Without a macro panel we use a "
+            "simple SPX-drawdown bucket; with rhyme labels available the "
+            "labeling can be replaced by `label_from_z`."
+        ),
+    )
 
 with st.sidebar.expander("Objective", expanded=True):
     obj = st.radio(
@@ -201,9 +301,52 @@ with st.sidebar.expander("Constraints", expanded=False):
     rf_annual = st.slider("Risk-free rate (%)", 0.0, 8.0, 3.0, 0.25) / 100.0
     allow_short = st.checkbox("Allow short positions", value=False)
     use_group_caps = st.checkbox("Apply group caps", value=True,
-                                 help="Equity ≤90%, Bonds ≤90%, Credit ≤50%, Real ≤30%, Cash ≤30%")
+                                 help="Editable in the 'Group bounds' sub-section below.")
     uniform_lb = st.slider("Per-asset lower bound (%)", 0.0, 30.0, 0.0, 1.0) / 100.0
     uniform_ub = st.slider("Per-asset upper bound (%)", 10.0, 100.0, 100.0, 5.0) / 100.0
+    use_turnover_cap = st.checkbox(
+        "Turnover cap",
+        value=False,
+        help="Annualized L1 turnover ≤ cap (vs current weights = benchmark).",
+    )
+    if use_turnover_cap:
+        turnover_cap_annual = st.slider(
+            "Turnover cap (% annual)", 5.0, 400.0, 100.0, 5.0,
+        ) / 100.0
+    else:
+        turnover_cap_annual = None
+
+with st.sidebar.expander("Per-asset box bounds", expanded=False):
+    st.caption("Override the uniform bounds for individual assets.")
+    if "per_asset_box" not in st.session_state:
+        st.session_state.per_asset_box = {}
+    enable_per_asset = st.checkbox("Enable per-asset bounds", value=False)
+
+with st.sidebar.expander("Group bounds (editable)", expanded=False):
+    st.caption("Editable group caps. Applied when 'Apply group caps' is on.")
+    if "group_bounds_edits" not in st.session_state:
+        st.session_state.group_bounds_edits = {
+            "equity": (0.0, 0.90),
+            "rates": (0.0, 0.90),
+            "credit": (0.0, 0.50),
+            "real": (0.0, 0.30),
+            "cash": (0.0, 0.30),
+        }
+    new_groups = {}
+    for g, (lo, hi) in st.session_state.group_bounds_edits.items():
+        col_lo, col_hi = st.columns(2)
+        with col_lo:
+            new_lo = st.number_input(
+                f"{g} min %", min_value=0.0, max_value=100.0,
+                value=float(lo * 100), step=5.0, key=f"glo_{g}",
+            ) / 100.0
+        with col_hi:
+            new_hi = st.number_input(
+                f"{g} max %", min_value=0.0, max_value=100.0,
+                value=float(hi * 100), step=5.0, key=f"ghi_{g}",
+            ) / 100.0
+        new_groups[g] = (new_lo, new_hi)
+    st.session_state.group_bounds_edits = new_groups
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +354,9 @@ with st.sidebar.expander("Constraints", expanded=False):
 # ---------------------------------------------------------------------------
 
 
-if data_choice == "Default (built-in)":
+start_filter = None if long_term_model else "2000-01-01"
+
+if source_mode == "Public (Yahoo + cache)":
     try:
         prices = _cached_prices()
     except FileNotFoundError as e:
@@ -220,20 +365,87 @@ if data_choice == "Default (built-in)":
     codes = TIERS[tier_name]
     buf = io.BytesIO()
     prices.to_parquet(buf)
-    rets = _cached_returns("default", buf.getvalue(), ",".join(codes))
+    rets = _cached_returns(
+        "default", buf.getvalue(), ",".join(codes),
+        extend_history=long_term_model, start=start_filter,
+    )
     panel_source = "default"
+elif source_mode == "Private (tabula)":
+    if not TABULA_PANEL_PATH.exists():
+        st.error(
+            f"Tabula parquet not found at `{TABULA_PANEL_PATH}`. "
+            "Build it with tabula's pipeline first."
+        )
+        st.stop()
+    try:
+        prices = _cached_tabula_panel(str(TABULA_PANEL_PATH))
+    except Exception as e:
+        st.error(f"Failed to read tabula parquet: {e}")
+        st.stop()
+    if prices.empty:
+        st.error(
+            "No tabula series mapped to a compose asset. "
+            "Add IDs to `TABULA_SERIES_MAP` in `app.py`."
+        )
+        st.stop()
+    codes = TIERS[tier_name]
+    # Filter codes to those whose ticker is present in the tabula panel.
+    avail_codes = [c for c in codes if BY_CODE[c].ticker in prices.columns]
+    if not avail_codes:
+        st.error(
+            "Tabula panel does not contain any tickers for this tier. "
+            f"Wanted: {[BY_CODE[c].ticker for c in codes]}; "
+            f"have: {list(prices.columns)}."
+        )
+        st.stop()
+    if len(avail_codes) < len(codes):
+        st.warning(
+            "Tabula is missing some tier tickers — running with the "
+            f"available subset: {avail_codes}"
+        )
+    codes = avail_codes
+    buf = io.BytesIO()
+    prices.to_parquet(buf)
+    rets = _cached_returns(
+        "tabula", buf.getvalue(), ",".join(codes),
+        extend_history=long_term_model, start=start_filter,
+    )
+    panel_source = "tabula"
 else:
     if uploaded is None:
-        st.info("Upload a CSV or JSON in the sidebar (first column = date, rest numeric).")
+        st.info(
+            "Upload a CSV / JSON / parquet in the sidebar "
+            "(first column = date, rest numeric)."
+        )
         st.stop()
-    raw = pd.read_json(uploaded) if uploaded.name.endswith(".json") else pd.read_csv(uploaded)
-    raw = raw.set_index(raw.columns[0])
+    if uploaded.name.endswith(".parquet"):
+        raw = pd.read_parquet(uploaded)
+    elif uploaded.name.endswith(".json"):
+        raw = pd.read_json(uploaded)
+    else:
+        raw = pd.read_csv(uploaded)
+    if raw.index.dtype == "object" or not isinstance(raw.index, pd.DatetimeIndex):
+        raw = raw.set_index(raw.columns[0])
     rets = returns_from_uploaded(raw, already_returns=(upload_kind == "returns"))
+    if start_filter is not None:
+        rets = rets.loc[pd.Timestamp(start_filter):]
     codes = list(rets.columns)
     panel_source = uploaded.name
 
 if rets.empty or rets.shape[0] < 24:
     st.error(f"Not enough history: {rets.shape[0]} monthly obs.")
+    st.stop()
+
+# When extending history we get an unbalanced frame; for the headline
+# solver pipeline use the dropna'd common-history view. The Backtest tab
+# operates on the unbalanced frame so it can pro-rate per window.
+rets_full = rets
+rets = rets_full.dropna(how="any")
+if rets.shape[0] < 24:
+    st.error(
+        f"Common history too short: {rets.shape[0]} monthly obs after dropna. "
+        "Try unchecking 'Long-term model' or shrinking the universe."
+    )
     st.stop()
 
 
@@ -246,6 +458,7 @@ cov_fns = {
     "sample": lambda r: sample_cov(r),
     "ledoit_wolf": lambda r: ledoit_wolf_cov(r),
     "oas": lambda r: oas_cov(r),
+    "ewma": lambda r: ewma_cov(r, half_life_months=ewma_half_life),
     "stress_blended": lambda r: stress_blended_cov(
         r, equity_col=("us_eq" if "us_eq" in r.columns else r.columns[0]),
         dd_threshold=dd_threshold, stress_weight=stress_weight,
@@ -254,6 +467,17 @@ cov_fns = {
 
 try:
     cov_res = cov_fns[cov_method](rets)
+    if use_regime_cov:
+        # Bucket history by SPX-drawdown regime and blend Σ.
+        eq_col = "us_eq" if "us_eq" in rets.columns else rets.columns[0]
+        regime = regime_from_drawdown(rets[eq_col], dd_threshold=dd_threshold)
+        # Today's prob: just look at the last month's regime.
+        today_label = regime.iloc[-1]
+        # Mild blend: 70% today's regime, 30% the other(s).
+        labels = sorted(set(regime.unique()))
+        probs = {label: (0.7 if label == today_label else 0.3 / max(1, len(labels) - 1))
+                 for label in labels}
+        cov_res = regime_blended_cov(rets, regime, today_probs=probs)
 except Exception as e:
     st.error(f"Covariance estimation failed: {e}")
     st.stop()
@@ -287,13 +511,29 @@ else:
 
 benchmark = default_benchmark(codes)
 group_map = {c: BY_CODE[c].group for c in codes if c in BY_CODE}
-group_bounds = default_group_bounds(codes) if use_group_caps else {}
+if use_group_caps:
+    # Filter the editable group bounds to groups present in this universe.
+    groups_in_use = {BY_CODE[c].group for c in codes}
+    group_bounds = {
+        g: tuple(v) for g, v in st.session_state.group_bounds_edits.items()
+        if g in groups_in_use
+    }
+else:
+    group_bounds = {}
+
+# Per-asset bounds: start uniform, then layer the per-asset overrides.
 box_bounds = {c: (uniform_lb, uniform_ub) for c in codes}
+if enable_per_asset:
+    for c in codes:
+        lo, hi = st.session_state.per_asset_box.get(c, (uniform_lb, uniform_ub))
+        box_bounds[c] = (lo, hi)
 
 cons = Constraints(
     box=box_bounds,
     group_bounds=group_bounds,
     group_map=group_map,
+    turnover=turnover_cap_annual,
+    current_weights=benchmark if turnover_cap_annual is not None else None,
     benchmark=benchmark,
     allow_short=allow_short,
 )
@@ -353,8 +593,10 @@ te_ann = float(np.sqrt(w_minus_b @ cov.values @ w_minus_b) * np.sqrt(12))
 # ---------------------------------------------------------------------------
 
 
-tab_overview, tab_universe, tab_views, tab_cov, tab_opt, tab_stress, tab_method = st.tabs(
-    ["Overview", "Universe", "Views (μ)", "Covariance", "Optimize", "Stress", "Methodology"]
+(tab_overview, tab_universe, tab_views, tab_cov, tab_opt,
+ tab_backtest, tab_stress, tab_method) = st.tabs(
+    ["Overview", "Universe", "Views (μ)", "Covariance",
+     "Optimize", "Backtest", "Stress", "Methodology"]
 )
 
 
@@ -515,6 +757,93 @@ with tab_views:
         f"(higher = more shrinkage toward MVP). "
         f"Black-Litterman δ = {bl_delta:.1f}."
     )
+
+    # ---- Black-Litterman with Views ---------------------------------------
+    st.subheader("Black-Litterman with Views")
+    st.caption(
+        "Express absolute or relative views and blend them with the BL "
+        "equilibrium prior. Absolute view: 'asset A returns X% annually'. "
+        "Relative view: 'asset A returns X% MORE than asset B annually'."
+    )
+
+    if "bl_views" not in st.session_state:
+        st.session_state.bl_views = pd.DataFrame([
+            {"asset": codes[0], "view_type": "absolute", "vs_asset": "",
+             "expected_return_pct": 8.0, "confidence_pct": 50.0},
+        ])
+    asset_options = list(codes)
+    edited_views = st.data_editor(
+        st.session_state.bl_views,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "asset": st.column_config.SelectboxColumn(
+                "Asset", options=asset_options, required=True,
+            ),
+            "view_type": st.column_config.SelectboxColumn(
+                "View type", options=["absolute", "relative"], required=True,
+            ),
+            "vs_asset": st.column_config.SelectboxColumn(
+                "Vs (relative only)", options=[""] + asset_options,
+            ),
+            "expected_return_pct": st.column_config.NumberColumn(
+                "Expected return (% annual)", min_value=-50.0, max_value=50.0, step=0.5,
+            ),
+            "confidence_pct": st.column_config.NumberColumn(
+                "Confidence (%)", min_value=1.0, max_value=99.0, step=5.0,
+            ),
+        },
+        key="bl_views_editor",
+    )
+    st.session_state.bl_views = edited_views
+
+    if st.button("Apply views to BL μ"):
+        # Build P, q, Ω from the views table.
+        views = edited_views.dropna(subset=["asset", "expected_return_pct"])
+        views = views[views["asset"].isin(codes)]
+        if views.empty:
+            st.warning("No usable views.")
+        else:
+            n = len(codes)
+            rows: list[np.ndarray] = []
+            qs: list[float] = []
+            confs: list[float] = []
+            for _, row in views.iterrows():
+                p = np.zeros(n)
+                a_idx = codes.index(row["asset"])
+                p[a_idx] = 1.0
+                q_annual = float(row["expected_return_pct"]) / 100.0
+                if row["view_type"] == "relative" and row.get("vs_asset") in codes:
+                    b_idx = codes.index(row["vs_asset"])
+                    p[b_idx] = -1.0
+                # De-annualize to monthly
+                q_monthly = (1.0 + q_annual) ** (1.0 / 12) - 1.0
+                rows.append(p)
+                qs.append(q_monthly)
+                confs.append(max(0.01, min(0.99, float(row["confidence_pct"]) / 100.0)))
+            P = np.vstack(rows)
+            q = np.array(qs)
+            # Map confidence ∈ (0, 1) to view-uncertainty Ω. High confidence
+            # = low Ω. Take diag(τ · P Σ Pᵀ) then scale by (1-c)/c.
+            tau = 0.05
+            base_omega = np.diag(np.diag(P @ (tau * cov.values) @ P.T))
+            scale = np.array([(1.0 - c) / c for c in confs])
+            omega = base_omega * np.diag(scale)
+            mu_views = blend_bl_with_views(mu_bl, cov, P, q, omega=omega, tau=tau)
+
+            cmp = pd.DataFrame({
+                "name": [BY_CODE[c].name for c in codes],
+                "BL equilibrium (% annual)": (mu_bl.mu_annual * 100).round(2).values,
+                "BL + views (% annual)": (mu_views.mu_annual * 100).round(2).values,
+                "Δ (pp)": ((mu_views.mu_annual - mu_bl.mu_annual) * 100).round(2).values,
+            }, index=codes)
+            st.dataframe(cmp, use_container_width=True)
+            st.caption(
+                "Active μ shown vs equilibrium μ. To use BL+views as the "
+                "main μ, set μ method = 'BL equilibrium' and rely on this "
+                "tab for what-if analysis (views are not yet wired into the "
+                "main solver to keep the headline solve stable)."
+            )
 
 
 # --- Covariance ------------------------------------------------------------
@@ -707,6 +1036,141 @@ with tab_opt:
                     f"expected block length = {block} months. Wider intervals = "
                     "more sensitivity to the sample path."
                 )
+
+
+# --- Backtest --------------------------------------------------------------
+
+
+with tab_backtest:
+    st.subheader("Walk-forward backtest")
+    st.caption(
+        "Rolling-window estimation, monthly rebal. Pro-rates per window: "
+        "an asset enters the optimization only once it has the chosen "
+        "minimum history. Methods compared head-to-head — pick what to "
+        "include below. Use the unbalanced ('extended') panel via the "
+        "long-term-model toggle in the sidebar to study pre-2007 history."
+    )
+
+    cb_lookback = st.slider(
+        "Look-back (months)", 24, 120, 60, 6, key="bt_lookback",
+        help="Window of monthly returns used to estimate Σ and μ at each rebal.",
+    )
+    cb_methods_all = {
+        "LW + max-Sharpe":     {"label": "LW + max-Sharpe",
+                                 "cov_method": "ledoit_wolf",
+                                 "mu_method": "historical",
+                                 "optimizer": "max_sharpe"},
+        "OAS + max-Sharpe":    {"label": "OAS + max-Sharpe",
+                                 "cov_method": "oas",
+                                 "mu_method": "historical",
+                                 "optimizer": "max_sharpe"},
+        "Stress-blend + max-Sharpe": {
+            "label": "Stress-blend + max-Sharpe",
+            "cov_method": "stress_blended",
+            "mu_method": "historical",
+            "optimizer": "max_sharpe",
+            "cov_kwargs": {"equity_col": "us_eq",
+                           "dd_threshold": dd_threshold,
+                           "stress_weight": stress_weight}
+        },
+        "HRP":                 {"label": "HRP",
+                                 "cov_method": "ledoit_wolf",
+                                 "mu_method": "historical",
+                                 "optimizer": "hrp"},
+        "Risk parity (ERC)":   {"label": "Risk parity (ERC)",
+                                 "cov_method": "ledoit_wolf",
+                                 "mu_method": "historical",
+                                 "optimizer": "risk_parity"},
+    }
+    selected = st.multiselect(
+        "Methods to compare",
+        list(cb_methods_all.keys()),
+        default=list(cb_methods_all.keys()),
+    )
+
+    run_bt = st.button("Run walk-forward")
+    if run_bt:
+        # Use the *unbalanced* extended frame so pro-rating can do its job.
+        bt_panel = rets_full
+        if bt_panel.shape[0] < cb_lookback + 12:
+            st.error(
+                f"Panel has {bt_panel.shape[0]} months; need at least "
+                f"{cb_lookback + 12}. Try a shorter look-back or extend "
+                "history via the sidebar toggle."
+            )
+        else:
+            specs = [cb_methods_all[m] for m in selected]
+            with st.spinner("Running walk-forward..."):
+                results = compare_methods(
+                    bt_panel, cons, specs,
+                    lookback_months=cb_lookback, rf_annual=rf_annual,
+                )
+            grid = metric_grid(results)
+            st.subheader("Method comparison")
+            st.dataframe(grid, use_container_width=True, hide_index=True)
+
+            # Two-column layout: cumulative wealth on left, stacked area on right
+            colL, colR = st.columns([3, 2])
+            with colL:
+                st.subheader("Cumulative wealth ($1 → growth)")
+                fig = go.Figure()
+                for label, res in results.items():
+                    if res is None:
+                        continue
+                    fig.add_trace(go.Scatter(
+                        x=res.cum_wealth.index, y=res.cum_wealth.values,
+                        mode="lines", name=label,
+                    ))
+                fig.update_layout(
+                    height=480, yaxis_type="log",
+                    yaxis_title="Wealth (log scale)",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with colR:
+                # Stacked-area weights for the headline method (first selected)
+                live = [(label, res) for label, res in results.items()
+                        if res is not None]
+                if live:
+                    headline_label, headline_res = live[0]
+                    st.subheader(f"Weights evolution — {headline_label}")
+                    wh = headline_res.weights_history.fillna(0.0)
+                    # Asset color palette — keep stable
+                    assets = list(wh.columns)
+                    palette = px.colors.qualitative.Bold + px.colors.qualitative.Pastel
+                    fig = go.Figure()
+                    for i, c in enumerate(assets):
+                        name = BY_CODE[c].name if c in BY_CODE else c
+                        fig.add_trace(go.Scatter(
+                            x=wh.index, y=wh[c].values * 100,
+                            mode="lines", stackgroup="one",
+                            name=name,
+                            line=dict(color=palette[i % len(palette)], width=0.5),
+                            hovertemplate=f"{name}<br>%{{x|%Y-%m}}: %{{y:.1f}}%<extra></extra>",
+                        ))
+                    fig.update_layout(
+                        height=480, yaxis_title="Weight (%)",
+                        legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    with st.expander("Active-asset set per window", expanded=False):
+                        rows = []
+                        for win in headline_res.windows:
+                            rows.append({
+                                "rebal": win.rebal_date.date(),
+                                "n_active": len(win.active_assets),
+                                "active": ", ".join(win.active_assets),
+                            })
+                        st.dataframe(pd.DataFrame(rows),
+                                     use_container_width=True, hide_index=True)
+            st.caption(
+                "Pro-rating: assets without enough history at a given rebal "
+                "drop out and the constraints renormalize automatically. "
+                "Group caps remain literal (a 90% equity cap stays 90% on "
+                "the active universe)."
+            )
 
 
 # --- Stress ----------------------------------------------------------------
