@@ -203,7 +203,7 @@ if source_mode == "Custom upload":
 tier_name = st.sidebar.radio("Universe", list(TIERS.keys()), index=1)
 
 long_term_model = st.sidebar.checkbox(
-    "Long-term model (full history)",
+    "Long-term mode (full history)",
     value=False,
     help=(
         "OFF (default): panel filtered to 2000-01-01+. "
@@ -310,20 +310,21 @@ with st.sidebar.expander("Objective", expanded=True):
         index=0,
     )
     if obj == "min_var_at_target":
-        # Slider in annualized return %.  Default at 25% (effectively the max-
-        # return corner for most universes — the optimizer will clip if the
-        # target is unreachable).  Sliding lower asks for the min-vol portfolio
-        # at that target return — still on the efficient frontier, just below
-        # the max-Sharpe point.
+        # Slider in annualized return %.  Default 10% — feasible for most
+        # diversified universes.  Slide UP to push toward higher-return /
+        # higher-vol portfolios (eventually infeasible if target exceeds the
+        # max-attainable return under constraints).  Slide DOWN for lower-vol
+        # portfolios at lower targets.  Still on the efficient frontier.
         target_return_annual = st.slider(
             "Target return (% annual)",
-            min_value=0.0, max_value=25.0, value=25.0, step=0.25,
+            min_value=0.0, max_value=25.0, value=10.0, step=0.25,
             help=(
-                "Default: 25% (max-return corner — the optimizer puts all "
-                "weight in the highest-μ asset under constraints).  Slide "
-                "DOWN to ask for the lowest-vol portfolio whose expected "
-                "return is at least the target.  Still on the efficient "
-                "frontier; just a different point than max-Sharpe."
+                "Default: 10% (feasible for most diversified universes).  "
+                "Asks min_variance_at_target for the lowest-vol portfolio "
+                "whose expected return is at least the target.  Slide UP "
+                "for higher-return points on the efficient frontier "
+                "(eventually infeasible at the max-return corner); slide "
+                "DOWN for lower-vol points."
             ),
         ) / 100.0
     else:
@@ -492,7 +493,7 @@ rets = rets_full.dropna(how="any")
 if rets.shape[0] < 24:
     st.error(
         f"Common history too short: {rets.shape[0]} monthly obs after dropna. "
-        "Try unchecking 'Long-term model' or shrinking the universe."
+        "Try unchecking 'Long-term mode' or shrinking the universe."
     )
     st.stop()
 
@@ -1100,7 +1101,7 @@ with tab_backtest:
         "an asset enters the optimization only once it has the chosen "
         "minimum history. Methods compared head-to-head — pick what to "
         "include below. Use the unbalanced ('extended') panel via the "
-        "long-term-model toggle in the sidebar to study pre-2007 history."
+        "long-term-mode toggle in the sidebar to study pre-2007 history."
     )
 
     cb_lookback = st.slider(
