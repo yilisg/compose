@@ -77,22 +77,22 @@ from compose_lib.universe import (
 # users with a tabula panel can drive Compose end-to-end. Anything not
 # in this mapping is dropped silently.
 TABULA_SERIES_MAP: dict[str, str] = {
-    # --- Yahoo tickers used by tabula (most common case) ---
-    "SPY": "us_eq",
-    "AGG": "us_agg",
-    "EFA": "intl_eq",
-    "EEM": "em_eq",
-    "GLD": "gold",
-    "DBC": "comdty",
-    "IEF": "us_tsy",
-    "LQD": "us_ig",
-    "HYG": "us_hy",
-    "TIP": "us_tips",
-    "VNQ": "us_reit",
-    "^IRX": "cash",
-    # --- common alternative IDs ---
-    "^GSPC": "us_eq",
-    "GC=F": "gold",
+    # Tabula uses internal `<country>.<asset_class>.<category>.<specifier>`
+    # series IDs, not Yahoo tickers. Map the ones compose's universe needs.
+    # Prefer total-return (`tr`) over price-only (`px`) where both exist.
+    "us.equity.tr.spx":         "us_eq",
+    "us.equity.px.spx":         "us_eq",     # fallback if TR absent
+    "us.rates.tr.govt10y":      "us_tsy",    # 10y treasury TR (no direct AGG match in tabula)
+    "us.credit.tr.dj_corp":     "us_ig",
+    "us.credit.tr.hy_master2":  "us_hy",
+    "us.credit.tr.tips":        "us_tips",
+    "global.equity.tr.developed": "intl_eq",
+    "global.equity.tr.em":      "em_eq",
+    "us.cmdty.gold.ny":         "gold",
+    "us.cmdty.gold.london_pm":  "gold",      # fallback
+    "us.commodity.gold":        "gold",      # yahoo-sourced fallback
+    "us.cmdty.tr.gsci":         "comdty",
+    "us.rates.govt.3m":         "cash",      # 3-mo T-bill yield proxy
 }
 
 
