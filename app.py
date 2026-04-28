@@ -78,21 +78,21 @@ from compose_lib.universe import (
 # in this mapping is dropped silently.
 TABULA_SERIES_MAP: dict[str, str] = {
     # Tabula uses internal `<country>.<asset_class>.<category>.<specifier>`
-    # series IDs, not Yahoo tickers. Map the ones compose's universe needs.
-    # Prefer total-return (`tr`) over price-only (`px`) where both exist.
-    "us.equity.tr.spx":         "us_eq",
-    "us.equity.px.spx":         "us_eq",     # fallback if TR absent
-    "us.rates.tr.govt10y":      "us_tsy",    # 10y treasury TR (no direct AGG match in tabula)
-    "us.credit.tr.dj_corp":     "us_ig",
-    "us.credit.tr.hy_master2":  "us_hy",
-    "us.credit.tr.tips":        "us_tips",
+    # series IDs, not Yahoo tickers. EXACTLY ONE tabula series_id per
+    # compose code — duplicates would collide in pivot_table(aggfunc="last")
+    # and silently mix levels (e.g. TR vs PX of SPX have ~3× ratio →
+    # crossover months show ~200% spurious returns). Prefer total-return
+    # (`tr`) for asset-return computation.
+    "us.equity.tr.spx":           "us_eq",
+    "us.rates.tr.govt10y":        "us_tsy",   # 10y treasury TR (no direct AGG match in tabula)
+    "us.credit.tr.dj_corp":       "us_ig",
+    "us.credit.tr.hy_master2":    "us_hy",
+    "us.credit.tr.tips":          "us_tips",
     "global.equity.tr.developed": "intl_eq",
-    "global.equity.tr.em":      "em_eq",
-    "us.cmdty.gold.ny":         "gold",
-    "us.cmdty.gold.london_pm":  "gold",      # fallback
-    "us.commodity.gold":        "gold",      # yahoo-sourced fallback
-    "us.cmdty.tr.gsci":         "comdty",
-    "us.rates.govt.3m":         "cash",      # 3-mo T-bill yield proxy
+    "global.equity.tr.em":        "em_eq",
+    "us.cmdty.gold.ny":           "gold",
+    "us.cmdty.tr.gsci":           "comdty",
+    "us.rates.govt.3m":           "cash",     # 3-mo T-bill yield proxy
 }
 
 
@@ -131,6 +131,20 @@ def _cached_tabula_panel(path_str: str):
     """Load the tabula long-format parquet and pivot to a wide price panel
     keyed by compose asset code. We read directly with `pd.read_parquet`
     rather than importing tabula, per the brief."""
+    # Hard-fail if multiple tabula series_ids collide on the same compose code —
+    # pivot_table aggfunc='last' would silently mix levels (e.g. SPX TR ~3× PX
+    # → crossover months show ~200% spurious returns). One source per code.
+    _seen: dict[str, str] = {}
+    for tid, code in TABULA_SERIES_MAP.items():
+        if code in _seen.values():
+            collider = next(t for t, c in _seen.items() if c == code)
+            raise ValueError(
+                f"TABULA_SERIES_MAP has multiple sources for compose code "
+                f"{code!r}: {collider!r} and {tid!r}. Remove one — keep "
+                f"exactly one tabula series_id per compose code."
+            )
+        _seen[tid] = code
+
     df = pd.read_parquet(path_str)
     if not {"series_id", "observation_date", "value"}.issubset(df.columns):
         raise ValueError(
