@@ -1,5 +1,10 @@
 """Pull fresh daily prices for every asset in every tier and write
-`data/default_prices.parquet`. Run once when you want a fresh cache."""
+`data/default_prices.parquet`. Run once when you want a fresh cache.
+
+The cached panel also includes Vanguard mutual-fund predecessors so the
+"long-term model" toggle in the app can splice history without a live
+network call. See `compose_lib/returns.py::SPLICE_MAP`.
+"""
 
 from __future__ import annotations
 
@@ -8,10 +13,15 @@ import sys
 from compose_lib.data_fetch import all_tickers, fetch_prices, save_default_panel
 
 
+# Vanguard mutual-fund predecessors used by the long-term-model splice path.
+SPLICE_PREDECESSORS = ["VFINX", "VBMFX", "VFITX", "VWESX",
+                       "VEIEX", "VGTSX", "VUSTX"]
+
+
 def main() -> int:
-    tickers = all_tickers()
+    tickers = sorted(set(all_tickers()) | set(SPLICE_PREDECESSORS))
     print(f"Fetching {len(tickers)} tickers from Yahoo: {tickers}")
-    df = fetch_prices(tickers, start="2000-01-01")
+    df = fetch_prices(tickers, start="1980-01-01")
     missing = [t for t in tickers if t not in df.columns]
     if missing:
         print(f"WARNING: missing from Yahoo response: {missing}", file=sys.stderr)

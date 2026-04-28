@@ -60,6 +60,9 @@ class Solution:
     sharpe: float              # annualized, net of rf
     method: str
     meta: dict = field(default_factory=dict)
+    active_assets: list[str] | None = None  # codes used in the optimization
+                                             # (subset of full universe when
+                                             # pro-rating around missing data)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +96,46 @@ def _cvx_constraints(w: cp.Variable, codes: list[str], cov: pd.DataFrame,
         out.append(cp.quad_form(w - w_bm, cp.psd_wrap(cov.values)) <= te_m ** 2)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pro-rating helper
+# ---------------------------------------------------------------------------
+
+
+def subset_constraints(cons: Constraints, active: list[str]) -> Constraints:
+    """Return a new `Constraints` restricted to the `active` asset codes.
+
+    Group bounds are kept literal — a 90% equity cap on the full universe
+    remains a 90% equity cap on the subset (the cap is on the share of
+    *the active universe* devoted to equity, which is what the brief asks
+    for). Box and benchmark dicts are filtered. Benchmark is renormalized
+    to sum to 1 over the active set so TE constraints stay consistent."""
+    box = {c: cons.box.get(c, (0.0, 1.0)) for c in active}
+    group_map = {c: cons.group_map.get(c) for c in active if cons.group_map.get(c)}
+    bench = None
+    if cons.benchmark is not None:
+        bench_sub = {c: cons.benchmark.get(c, 0.0) for c in active}
+        total = sum(bench_sub.values())
+        if total > 0:
+            bench = {c: v / total for c, v in bench_sub.items()}
+        else:
+            bench = {c: 1.0 / len(active) for c in active}
+    cur = None
+    if cons.current_weights is not None:
+        cur_sub = {c: cons.current_weights.get(c, 0.0) for c in active}
+        total = sum(cur_sub.values())
+        cur = {c: v / total for c, v in cur_sub.items()} if total > 0 else cur_sub
+    return Constraints(
+        box=box,
+        group_bounds=dict(cons.group_bounds),  # literal, per docstring
+        group_map=group_map,
+        turnover=cons.turnover,
+        current_weights=cur,
+        tracking_error=cons.tracking_error,
+        benchmark=bench,
+        allow_short=cons.allow_short,
+    )
 
 
 # ---------------------------------------------------------------------------
