@@ -38,6 +38,7 @@ class CovResult:
     shrinkage: float | None   # shrinkage intensity if applicable
     n_obs: int
     mask: pd.Series | None = None  # bool series of rows used (stress mode)
+    meta: dict | None = None       # estimator-specific extras (regime weights etc.)
 
 
 def sample_cov(rets: pd.DataFrame) -> CovResult:
@@ -108,6 +109,88 @@ def stress_blended_cov(
         cov=cov, cov_annual=cov * MONTHS,
         method=f"stress_blended (p={p:.2f}, dd≥{int(dd_threshold*100)}%)",
         shrinkage=None, n_obs=len(rets), mask=mask,
+    )
+
+
+def ewma_cov(
+    rets: pd.DataFrame,
+    half_life_months: float = 12.0,
+) -> CovResult:
+    """Exponentially-weighted moving-average covariance with `half_life_months`.
+
+    Weight on observation at lag k (0 = most recent) is `α^k` with
+    `α = 0.5 ** (1 / half_life)`. The estimator is the demeaned weighted
+    cross-product divided by the sum of weights; not corrected for
+    bias because for monthly portfolios the bias is small. Useful when
+    the user wants the recent regime to dominate without going all the
+    way to a hard regime split."""
+    half_life = max(1.0, float(half_life_months))
+    alpha = 0.5 ** (1.0 / half_life)
+    n = len(rets)
+    # Most-recent observation has weight 1; older observations decay by α.
+    # k = 0 is most recent.
+    k = np.arange(n)[::-1]  # n-1 ... 0 reversed -> 0 = oldest, n-1 = newest
+    # We want most-recent weight = 1, oldest = α^(n-1)
+    weights = alpha ** (k)  # shape (n,)
+    weights = weights / weights.sum()
+    X = rets.values
+    mu_w = (weights[:, None] * X).sum(axis=0)
+    Xc = X - mu_w
+    cov_mat = (Xc * weights[:, None]).T @ Xc
+    cov = pd.DataFrame(cov_mat, index=rets.columns, columns=rets.columns)
+    return CovResult(
+        cov=cov, cov_annual=cov * MONTHS,
+        method=f"ewma (half-life={half_life_months:.0f}m)",
+        shrinkage=None, n_obs=n,
+    )
+
+
+def regime_blended_cov(
+    rets: pd.DataFrame,
+    regime: pd.Series,
+    today_probs: dict[str, float] | None = None,
+    base: str = "ledoit_wolf",
+    min_obs: int = 24,
+) -> CovResult:
+    """Compute Σ per regime label (string-indexed), blend by today's
+    regime probabilities (or equal weight if none provided).
+
+    `regime` is a Series indexed by month with string labels (e.g. from
+    `regime_label.label_from_z` applied per month, or simply
+    'Stress'/'Normal' from the SPX-drawdown bucket).
+
+    Falls back to full-sample LW if any regime has fewer than `min_obs`
+    months."""
+    base_fn = ledoit_wolf_cov if base == "ledoit_wolf" else oas_cov
+    aligned = regime.reindex(rets.index).dropna()
+    rets = rets.loc[aligned.index]
+    counts = aligned.value_counts()
+    if (counts < min_obs).any():
+        res = ledoit_wolf_cov(rets)
+        res.method = "regime_blended (fallback→LW)"
+        return res
+    cov_per: dict[str, pd.DataFrame] = {}
+    for label in counts.index:
+        sub = rets.loc[aligned == label]
+        cov_per[label] = base_fn(sub).cov
+
+    if today_probs is None:
+        today_probs = {label: 1.0 / len(counts) for label in counts.index}
+    # Fill any missing labels with zero weight; renormalize.
+    pw = {label: float(today_probs.get(label, 0.0)) for label in counts.index}
+    s = sum(pw.values())
+    if s <= 0:
+        pw = {label: 1.0 / len(counts) for label in counts.index}
+    else:
+        pw = {label: v / s for label, v in pw.items()}
+
+    blend = sum(pw[label] * cov_per[label].values for label in counts.index)
+    cov = pd.DataFrame(blend, index=rets.columns, columns=rets.columns)
+    return CovResult(
+        cov=cov, cov_annual=cov * MONTHS,
+        method=f"regime_blended ({len(counts)} regimes)",
+        shrinkage=None, n_obs=len(rets),
+        meta={"regime_counts": counts.to_dict(), "weights": pw},
     )
 
 
