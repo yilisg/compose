@@ -57,6 +57,7 @@ from compose_lib.optimize import (
     max_sharpe,
     min_cvar,
     min_variance,
+    min_variance_at_target,
     resampled,
     risk_parity,
 )
@@ -206,12 +207,25 @@ long_term_model = st.sidebar.checkbox(
     value=False,
     help=(
         "OFF (default): panel filtered to 2000-01-01+. "
-        "ON: use the full available history. With Public source this also "
-        "splices Vanguard mutual-fund / FRED predecessors onto the modern "
-        "ETFs (SPY←VFINX from 1980, AGG←VBMFX from 1986, etc.) — fixes "
-        "Tier 3's HYG-induced 2007 cliff."
+        "ON: pre-2000 history through, with a year slider below.  With "
+        "Public source this also splices Vanguard mutual-fund / FRED "
+        "predecessors onto the modern ETFs (SPY←VFINX from 1980, AGG←VBMFX "
+        "from 1986, etc.) — fixes Tier 3's HYG-induced 2007 cliff."
     ),
 )
+if long_term_model:
+    earliest_year = st.sidebar.slider(
+        "Earliest year",
+        min_value=1900, max_value=1999, value=1950, step=10,
+        help=(
+            "How far back to extend the panel.  1950 covers post-WWII; "
+            "earlier surfaces 1930s / pre-WWII regimes but adds noisy "
+            "data and limits the cross-asset universe (TIPS / EM / IG "
+            "ETFs only have predecessors from the 80s/90s)."
+        ),
+    )
+else:
+    earliest_year = 2000
 
 with st.sidebar.expander("Expected returns (μ)", expanded=True):
     mu_method = st.radio(
@@ -280,20 +294,40 @@ with st.sidebar.expander("Covariance (Σ)", expanded=True):
 with st.sidebar.expander("Objective", expanded=True):
     obj = st.radio(
         "Objective",
-        ["max_sharpe", "max_ret_te", "max_ret_vol", "min_var",
-         "risk_parity", "hrp", "min_cvar", "resampled"],
+        ["max_sharpe", "min_var_at_target", "max_ret_te", "max_ret_vol",
+         "min_var", "risk_parity", "hrp", "min_cvar", "resampled"],
         format_func=lambda x: {
-            "max_sharpe":   "Max Sharpe (default)",
-            "max_ret_te":   "Max Return s.t. TE",
-            "max_ret_vol":  "Max Return s.t. Vol",
-            "min_var":      "Min Variance",
-            "risk_parity":  "Risk Parity (ERC)",
-            "hrp":          "Hierarchical Risk Parity",
-            "min_cvar":     "Min CVaR",
-            "resampled":    "Resampled (Michaud)",
+            "max_sharpe":         "Max Sharpe (default)",
+            "min_var_at_target":  "Target Return (min vol)",
+            "max_ret_te":         "Max Return s.t. TE",
+            "max_ret_vol":        "Max Return s.t. Vol",
+            "min_var":            "Min Variance",
+            "risk_parity":        "Risk Parity (ERC)",
+            "hrp":                "Hierarchical Risk Parity",
+            "min_cvar":           "Min CVaR",
+            "resampled":          "Resampled (Michaud)",
         }[x],
         index=0,
     )
+    if obj == "min_var_at_target":
+        # Slider in annualized return %.  Default at 25% (effectively the max-
+        # return corner for most universes — the optimizer will clip if the
+        # target is unreachable).  Sliding lower asks for the min-vol portfolio
+        # at that target return — still on the efficient frontier, just below
+        # the max-Sharpe point.
+        target_return_annual = st.slider(
+            "Target return (% annual)",
+            min_value=0.0, max_value=25.0, value=25.0, step=0.25,
+            help=(
+                "Default: 25% (max-return corner — the optimizer puts all "
+                "weight in the highest-μ asset under constraints).  Slide "
+                "DOWN to ask for the lowest-vol portfolio whose expected "
+                "return is at least the target.  Still on the efficient "
+                "frontier; just a different point than max-Sharpe."
+            ),
+        ) / 100.0
+    else:
+        target_return_annual = 0.0
     if obj == "max_ret_te":
         te_cap = st.slider("Tracking error cap (% annual)", 1.0, 15.0, 5.0, 0.5) / 100.0
     else:
@@ -368,7 +402,7 @@ with st.sidebar.expander("Group bounds (editable)", expanded=False):
 # ---------------------------------------------------------------------------
 
 
-start_filter = None if long_term_model else "2000-01-01"
+start_filter = f"{earliest_year}-01-01"
 
 if source_mode == "Public (Yahoo + cache)":
     try:
@@ -561,6 +595,10 @@ cons = Constraints(
 def _solve() -> "Solution":  # noqa: F821
     if obj == "max_sharpe":
         return max_sharpe(cov, mu_res.mu, cons, rf_annual=rf_annual)
+    if obj == "min_var_at_target":
+        # Annualized target → monthly target (mu is monthly)
+        target_monthly = target_return_annual / 12.0
+        return min_variance_at_target(cov, mu_res.mu, target_monthly, cons, rf_annual=rf_annual)
     if obj == "max_ret_te":
         return max_return_at_te(cov, mu_res.mu, te_cap, cons, rf_annual=rf_annual)
     if obj == "max_ret_vol":
