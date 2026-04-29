@@ -712,9 +712,14 @@ with tab_overview:
     rc_display["% of σ"] = (rc_display["% of σ"] * 100).round(1).astype(str) + "%"
     st.dataframe(rc_display, use_container_width=True, hide_index=True)
 
+    shrink_str = (
+        f"λ = {cov_res.shrinkage:.3f}"
+        if cov_res.shrinkage is not None
+        else "n/a (EWMA / regime-blended Σ has no shrinkage parameter)"
+    )
     st.caption(
         f"Benchmark (60/40): {bm_w.round(2).to_dict()}. "
-        f"Shrinkage intensity λ = {cov_res.shrinkage:.3f} (if applicable). "
+        f"Shrinkage intensity {shrink_str}. "
         f"Risk-free rate = {rf_annual * 100:.2f}% annual."
     )
 

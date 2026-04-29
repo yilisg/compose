@@ -48,7 +48,10 @@ BY_CODE: dict[str, AssetSpec] = {a.code: a for a in ALL_ASSETS}
 
 TIERS: dict[str, list[str]] = {
     "Tier 0 — Starter (3)":              ["us_eq", "us_agg", "cash"],
-    "Tier 1 — Global 60/40 (5)":         ["us_eq", "us_agg", "cash", "intl_eq", "gold"],
+    # us_tsy is included as a bond fallback for sources (e.g. tabula private
+    # mode) where us_agg has no direct equivalent — keeps the 60/40 split
+    # honest. With us_agg available, default_benchmark prefers us_agg.
+    "Tier 1 — Global 60/40 (5)":         ["us_eq", "us_agg", "us_tsy", "cash", "intl_eq", "gold"],
     "Tier 2 — All-Weather starter (7)":  ["us_eq", "us_agg", "cash", "intl_eq", "gold",
                                           "em_eq", "comdty"],
     "Tier 3 — Diversified (10)":         ["us_eq", "intl_eq", "em_eq",
@@ -57,13 +60,23 @@ TIERS: dict[str, list[str]] = {
 }
 
 
-#: A simple 60/40 benchmark used for the tracking-error constraint. Falls
-#: back to 100% US equity if AGG is not in the selected universe.
+#: A simple 60/40 benchmark used for the tracking-error constraint. Picks
+#: the first available equity proxy and the first available bond proxy from
+#: the active universe. If no bond is available (e.g. tabula private mode
+#: where us_agg has no equivalent), falls back to 100% equity rather than
+#: spreading weight equal-weight across non-bond assets.
 def default_benchmark(codes: list[str]) -> dict[str, float]:
-    if "us_eq" in codes and "us_agg" in codes:
-        return {"us_eq": 0.60, "us_agg": 0.40}
-    if "us_eq" in codes and "us_tsy" in codes:
-        return {"us_eq": 0.60, "us_tsy": 0.40}
+    # Hard-coded preference order — keep us_eq as the canonical equity proxy
+    # and us_agg / us_tsy as the canonical bonds. Other rates/credit codes
+    # (us_ig, us_hy, us_tips) are acceptable fallbacks but not preferred.
+    EQUITY_PRIORITY = ["us_eq", "intl_eq", "em_eq"]
+    BOND_PRIORITY = ["us_agg", "us_tsy", "us_ig", "us_tips", "us_hy"]
+    eq = next((c for c in EQUITY_PRIORITY if c in codes), None)
+    bond = next((c for c in BOND_PRIORITY if c in codes), None)
+    if eq and bond:
+        return {eq: 0.60, bond: 0.40}
+    if eq:
+        return {eq: 1.0}
     return {c: 1.0 / len(codes) for c in codes}
 
 
