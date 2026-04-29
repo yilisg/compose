@@ -127,6 +127,64 @@ def _cached_returns(
     )
 
 
+# --- Tabula panel resolver --------------------------------------------------
+# Bridges local development to Streamlit Cloud (private apps fetch the panel
+# parquet from yilisg/tabula via GitHub Contents API using a fine-grained PAT
+# in st.secrets).
+#
+# Cloud secrets schema:
+#     [tabula]
+#     owner = "yilisg"
+#     repo  = "tabula"
+#     path  = "data/output/tabula_panel.parquet"
+#     ref   = "main"
+#     token = "github_pat_..."   # Contents:read on yilisg/tabula
+
+_TABULA_LOCAL_DEFAULT = Path("/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet")
+_TABULA_TMP_CACHE = Path("/tmp/tabula_panel.parquet")
+
+
+@st.cache_data(show_spinner="Fetching tabula panel from GitHub…")
+def _fetch_tabula_panel_from_github() -> bytes:
+    import requests
+    cfg = st.secrets["tabula"]
+    url = f"https://api.github.com/repos/{cfg['owner']}/{cfg['repo']}/contents/{cfg['path']}"
+    if cfg.get("ref"):
+        url += f"?ref={cfg['ref']}"
+    r = requests.get(
+        url,
+        headers={
+            "Authorization": f"Bearer {cfg['token']}",
+            "Accept": "application/vnd.github.raw",
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+def _resolve_tabula_panel_path() -> Path:
+    """Resolve a usable local path to the tabula panel parquet.
+
+    Tries: local development default, in-container /tmp cache, then GitHub.
+    """
+    if _TABULA_LOCAL_DEFAULT.exists():
+        return _TABULA_LOCAL_DEFAULT
+    if _TABULA_TMP_CACHE.exists():
+        return _TABULA_TMP_CACHE
+    has_secrets = (
+        hasattr(st, "secrets") and "tabula" in st.secrets
+        and "token" in st.secrets["tabula"]
+    )
+    if not has_secrets:
+        raise FileNotFoundError(
+            "Tabula panel not found locally and no [tabula] block in "
+            "st.secrets — see README for cloud setup."
+        )
+    _TABULA_TMP_CACHE.write_bytes(_fetch_tabula_panel_from_github())
+    return _TABULA_TMP_CACHE
+
+
 @st.cache_data(show_spinner=False)
 def _cached_tabula_panel(path_str: str):
     """Load the tabula long-format parquet and pivot to a wide price panel
@@ -420,14 +478,12 @@ if source_mode == "Public (Yahoo + cache)":
     )
     panel_source = "default"
 elif source_mode == "Private (tabula)":
-    if not TABULA_PANEL_PATH.exists():
-        st.error(
-            f"Tabula parquet not found at `{TABULA_PANEL_PATH}`. "
-            "Build it with tabula's pipeline first."
-        )
-        st.stop()
     try:
-        prices = _cached_tabula_panel(str(TABULA_PANEL_PATH))
+        resolved = _resolve_tabula_panel_path()
+        prices = _cached_tabula_panel(str(resolved))
+    except FileNotFoundError as e:
+        st.error(str(e))
+        st.stop()
     except Exception as e:
         st.error(f"Failed to read tabula parquet: {e}")
         st.stop()
