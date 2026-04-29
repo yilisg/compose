@@ -97,7 +97,7 @@ TABULA_SERIES_MAP: dict[str, str] = {
 }
 
 
-TABULA_PANEL_PATH = Path("/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet")
+TABULA_PANEL_PATH = Path.home() / "Desktop/Claude/tabula/data/output/tabula_panel.parquet"
 
 
 st.set_page_config(page_title="Compose", layout="wide", page_icon="🎼")
@@ -140,7 +140,7 @@ def _cached_returns(
 #     ref   = "main"
 #     token = "github_pat_..."   # Contents:read on yilisg/tabula
 
-_TABULA_LOCAL_DEFAULT = Path("/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet")
+_TABULA_LOCAL_DEFAULT = Path.home() / "Desktop/Claude/tabula/data/output/tabula_panel.parquet"
 _TABULA_TMP_CACHE = Path("/tmp/tabula_panel.parquet")
 
 
